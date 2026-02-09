@@ -140,8 +140,8 @@ prepare_files_for_gemini() {
             break
         fi
         
-        # Make path absolute if necessary
-        if [[ "$file" != /* ]]; then
+        # Make path absolute if necessary (handle both Unix / and Windows D:/ paths)
+        if [[ "$file" != /* ]] && [[ ! "$file" =~ ^[A-Za-z]:/ ]]; then
             file="$working_dir/$file"
         fi
         
@@ -205,40 +205,60 @@ call_gemini() {
     
     # Rate limiting
     enforce_rate_limit
-    
+
     # Call Gemini
     local gemini_result=""
     local gemini_exit_code=0
-    
+
     # Timeout with GNU timeout or gtimeout (macOS)
     local timeout_cmd="timeout"
     if command -v gtimeout >/dev/null 2>&1; then
         timeout_cmd="gtimeout"
     fi
-    
-    # Prepare file contents for STDIN
-    local file_contents=""
+
+    # Write file contents to a temp file in the working directory.
+    # Gemini CLI ignores stdin in -p mode, so we must use a workspace file.
+    local temp_filename=".gemini_bridge_analysis_$(date +%s).txt"
+    local temp_filepath="$working_dir/$temp_filename"
+
     for file in $processed_files; do
         if [ -f "$file" ]; then
-            file_contents="${file_contents}=== File: $file ===\n\n"
-            file_contents="${file_contents}$(cat "$file" 2>/dev/null)\n\n"
+            echo "=== File: $file ===" >> "$temp_filepath"
+            echo "" >> "$temp_filepath"
+            cat "$file" >> "$temp_filepath" 2>/dev/null
+            echo -e "\n" >> "$temp_filepath"
         fi
     done
-    
-    # Debug: Show exact command being executed
-    debug_log 3 "Executing: echo [file contents] | gemini -p \"$gemini_prompt\""
-    
+
+    if [ ! -f "$temp_filepath" ]; then
+        debug_log 1 "Failed to create temp file for Gemini"
+        end_timer "gemini_call" >/dev/null
+        return 1
+    fi
+
+    local temp_size=$(stat -c%s "$temp_filepath" 2>/dev/null || stat -f%z "$temp_filepath" 2>/dev/null || echo "0")
+    debug_log 2 "Temp file created: $temp_filepath ($temp_size bytes)"
+
+    # Build the Gemini prompt: instruct it to read the temp file
+    local full_prompt="Read the file '$temp_filename' in the current directory. It contains $file_count source files concatenated together. ${gemini_prompt}"
+
+    debug_log 3 "Executing: gemini -y -p \"$full_prompt\" in $working_dir"
+
+    # Run Gemini with -y (auto-approve file reads) from the working directory
     if command -v "$timeout_cmd" >/dev/null 2>&1; then
-        gemini_result=$(echo -e "$file_contents" | "$timeout_cmd" "$GEMINI_TIMEOUT" gemini -p "$gemini_prompt" 2>&1)
+        gemini_result=$(cd "$working_dir" && "$timeout_cmd" "$GEMINI_TIMEOUT" gemini -y -p "$full_prompt" 2>&1)
         gemini_exit_code=$?
     else
-        # Fallback without timeout
-        gemini_result=$(echo -e "$file_contents" | gemini -p "$gemini_prompt" 2>&1)
+        gemini_result=$(cd "$working_dir" && gemini -y -p "$full_prompt" 2>&1)
         gemini_exit_code=$?
     fi
-    
+
+    # Clean up temp file
+    rm -f "$temp_filepath" 2>/dev/null
+    debug_log 2 "Temp file cleaned up"
+
     local duration=$(end_timer "gemini_call")
-    
+
     # Check result
     if [ "$gemini_exit_code" -eq 0 ] && [ -n "$gemini_result" ]; then
         # Cache successful response
